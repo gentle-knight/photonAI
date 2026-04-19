@@ -28,9 +28,28 @@ EXPECTED_COLS = 11
 V_PI_TXT_1BASED_INDEX = 11
 
 
+def _strip_optional_list_brackets(line: str) -> str:
+    """
+    去掉仿真/导出常见的整行方括号包裹，例如::
+
+        [-2.15e-07, -10.0, ...] -> -2.15e-07, -10.0, ...
+
+    若行首无 ``[`` 或行尾无 ``]``，则原样返回（兼容无括号格式）。
+    """
+    s = line.strip()
+    if len(s) >= 2 and s[0] == "[" and s[-1] == "]":
+        return s[1:-1].strip()
+    return s
+
+
 def load_raw_txt(path: str | Path) -> pd.DataFrame:
     """
     从 txt 读取数据：逗号分隔、11 列浮点；跳过空行与纯空白行。
+
+    支持两种常见行格式（等价）::
+
+        a,b,c,...,k
+        [a, b, c, ..., k]
 
     Raises:
         FileNotFoundError: 文件不存在
@@ -51,6 +70,7 @@ def load_raw_txt(path: str | Path) -> pd.DataFrame:
             line = raw.strip()
             if not line:
                 continue
+            line = _strip_optional_list_brackets(line)
             parts = [p.strip() for p in line.split(",")]
             if len(parts) != EXPECTED_COLS:
                 bad_lines.append((line_no, f"列数={len(parts)}，期望 {EXPECTED_COLS}"))

@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from src.config import AppConfig, load_config
-from src.data import INPUT_COLUMNS, TARGET_COLUMNS
+from src.data import INPUT_COLUMNS, TARGET_COLUMNS, _strip_optional_list_brackets
 from src.model import MLPRegressor
 from src.preprocess import load_scalers
 from src.trainer import load_weights
@@ -18,15 +18,39 @@ from src.trainer import load_weights
 logger = logging.getLogger(__name__)
 
 
+def _read_txt_inputs_eight_cols(path: Path) -> pd.DataFrame:
+    """读取无表头 txt：逗号分隔，支持整行 ``[...]`` 包裹；取前 8 列为输入。"""
+    rows: list[list[float]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, raw in enumerate(f, start=1):
+            s = raw.strip()
+            if not s:
+                continue
+            s = _strip_optional_list_brackets(s)
+            parts = [p.strip() for p in s.split(",")]
+            if len(parts) < len(INPUT_COLUMNS):
+                raise ValueError(
+                    f"{path} 第 {line_no} 行列数不足（{len(parts)}），至少需要 {len(INPUT_COLUMNS)} 列输入"
+                )
+            try:
+                row = [float(parts[j]) for j in range(len(INPUT_COLUMNS))]
+            except ValueError as e:
+                raise ValueError(f"{path} 第 {line_no} 行解析失败: {e}") from e
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"{path} 无有效数据行")
+    return pd.DataFrame(rows, columns=INPUT_COLUMNS)
+
+
 def _read_inputs_table(path: Path) -> pd.DataFrame:
-    """读取 8 列输入：支持逗号分隔 txt 或 csv。"""
+    """读取 8 列输入：支持逗号分隔 txt（可无表头、可带方括号）或 csv。"""
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"输入文件不存在: {path}")
     if path.suffix.lower() in {".csv"}:
         df = pd.read_csv(path)
     else:
-        df = pd.read_csv(path, header=None, names=INPUT_COLUMNS)
+        df = _read_txt_inputs_eight_cols(path)
     missing = [c for c in INPUT_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"输入缺少列: {missing}；需要列 {INPUT_COLUMNS}")
