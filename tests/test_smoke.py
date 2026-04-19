@@ -10,6 +10,7 @@ import torch
 import yaml
 
 from src.config import load_config
+from src.data import INPUT_COLUMNS
 from src.data import load_raw_txt
 from src.model import MLPRegressor
 from src.preprocess import prepare_training_data
@@ -106,3 +107,87 @@ def test_one_epoch_training_pipeline(tmp_path: Path) -> None:
     assert (run_dir / "checkpoints" / "best.pt").is_file()
     meta = json.loads((run_dir / "cleaning_meta.json").read_text(encoding="utf-8"))
     assert meta["n_train"] > 0
+
+
+def test_grouped_split_keeps_same_inputs_together(tmp_path: Path) -> None:
+    data_txt = tmp_path / "grouped_data.txt"
+    rng = np.random.default_rng(7)
+    rows = []
+    base_inputs = rng.normal(size=(24, 8))
+    for x in base_inputs:
+        for _ in range(3):
+            y0 = float(x[0] * 2.0 + rng.normal(scale=0.01))
+            y1 = float(x[1] * -1.5 + rng.normal(scale=0.01))
+            y2 = float(abs(x[2]) * 20.0 + 10.0 + rng.normal(scale=0.1))
+            rows.append(np.concatenate([x, [y0, y1, y2]]))
+    mat = np.asarray(rows, dtype=float)
+    data_txt.write_text(
+        "\n".join(",".join(str(v) for v in row) for row in mat),
+        encoding="utf-8",
+    )
+
+    cfg_dict = {
+        "data_path": str(data_txt),
+        "split_ratios": [0.7, 0.15, 0.15],
+        "random_seed": 3,
+        "split_mode": "grouped_stratified",
+        "split_stratify_target": "V_pi",
+        "split_stratify_bins": 6,
+        "remove_duplicate_rows": False,
+        "outlier_strategy": "none",
+        "outlier_apply_to": "targets",
+        "outlier_config": {
+            "iqr_k": 1.5,
+            "zscore_threshold": 4.0,
+            "quantile_lower": 0.001,
+            "quantile_upper": 0.999,
+        },
+        "remove_nonpositive_vpi": False,
+        "filter_v_pi_range": True,
+        "v_pi_min": 0.0,
+        "v_pi_max": 500.0,
+        "model": {
+            "input_dim": 8,
+            "hidden_dims": [16, 16],
+            "output_dim": 3,
+            "batchnorm": False,
+            "dropout": 0.0,
+            "residual": False,
+        },
+        "optimizer": {"name": "adamw", "lr": 0.01, "weight_decay": 0.0},
+        "scheduler": {
+            "type": "cosine",
+            "plateau_factor": 0.5,
+            "plateau_patience": 10,
+            "plateau_min_lr": 1e-6,
+        },
+        "training": {
+            "batch_size": 16,
+            "epochs": 1,
+            "early_stopping_patience": 1,
+            "num_workers": 0,
+        },
+        "loss": {"type": "huber", "huber_delta": 1.0, "target_weights": [1.0, 1.0, 1.0]},
+        "output_dir": str(tmp_path / "results"),
+    }
+    cfg_path = tmp_path / "cfg_grouped.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_dict), encoding="utf-8")
+
+    cfg = load_config(cfg_path)
+    df = load_raw_txt(data_txt)
+    run_dir = tmp_path / "run_grouped"
+    run_dir.mkdir()
+    bundle = prepare_training_data(df, cfg, run_dir)
+
+    split_data = json.loads((run_dir / "split_indices.json").read_text(encoding="utf-8"))
+    split_name_by_row = {}
+    for split_name, indices in split_data.items():
+        for idx in indices:
+            split_name_by_row[int(idx)] = split_name
+
+    cleaned = df.reset_index(drop=True)
+    for _, sub in cleaned.groupby(INPUT_COLUMNS, dropna=False):
+        assigned = {split_name_by_row[int(i)] for i in sub.index.to_list()}
+        assert len(assigned) == 1
+
+    assert len(bundle.X_train) > 0

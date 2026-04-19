@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -120,7 +121,7 @@ def clean_dataframe(
     return out
 
 
-def stratified_split_indices(
+def _random_split_indices(
     n: int,
     ratios: List[float],
     seed: int,
@@ -141,6 +142,130 @@ def stratified_split_indices(
     i_val = idx[n_train : n_train + n_val]
     i_test = idx[n_train + n_val :]
     return i_train, i_val, i_test
+
+
+def _quantile_bin_labels(values: np.ndarray, n_bins: int) -> np.ndarray | None:
+    """
+    基于秩做近似等频分桶，避免重复值导致的 qcut 退化。
+    返回每个样本所属桶标签；若样本过少则返回 None。
+    """
+    if len(values) < 2:
+        return None
+    q = min(int(n_bins), len(values))
+    if q < 2:
+        return None
+    ranks = pd.Series(values).rank(method="first")
+    labels = pd.qcut(ranks, q=q, labels=False, duplicates="drop")
+    if labels is None:
+        return None
+    arr = np.asarray(labels, dtype=int)
+    if len(np.unique(arr)) < 2:
+        return None
+    return arr
+
+
+def _grouped_split_indices(
+    df: pd.DataFrame,
+    ratios: List[float],
+    seed: int,
+    stratify_target: str,
+    stratify_bins: int,
+    report_lines: List[str],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    先按输入 8 维分组，再在组级别按目标统计量近似分层切分。
+    这样可避免“同输入异输出”同时落在 train/val/test，提升评估稳定性。
+    若分层条件不足，则退化为组级随机切分。
+    """
+    if len(df) < 3:
+        raise ValueError("样本数过少，无法做 train/val/test 切分。")
+
+    group_ids = df.groupby(INPUT_COLUMNS, sort=False, dropna=False).ngroup().to_numpy()
+    n_groups = int(group_ids.max()) + 1
+    group_df = df.copy()
+    group_df["_group_id"] = group_ids
+    group_stat = (
+        group_df.groupby("_group_id", sort=True)
+        .agg(group_size=("V_pi", "size"), strat_value=(stratify_target, "median"))
+        .reset_index()
+    )
+    group_id_arr = group_stat["_group_id"].to_numpy(dtype=int)
+    labels = _quantile_bin_labels(
+        group_stat["strat_value"].to_numpy(dtype=np.float64),
+        stratify_bins,
+    )
+
+    tr, va, te = ratios
+    holdout_ratio = va + te
+    val_ratio_in_holdout = va / holdout_ratio
+
+    def _split_groups(use_stratify: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        strat = labels if use_stratify and labels is not None else None
+        train_groups, holdout_groups = train_test_split(
+            group_id_arr,
+            train_size=tr,
+            test_size=holdout_ratio,
+            random_state=seed,
+            shuffle=True,
+            stratify=strat,
+        )
+        holdout_strat = None
+        if strat is not None:
+            label_map = dict(zip(group_id_arr.tolist(), labels.tolist()))
+            holdout_labels = np.asarray(
+                [label_map[int(g)] for g in holdout_groups],
+                dtype=int,
+            )
+            if len(np.unique(holdout_labels)) >= 2:
+                holdout_strat = holdout_labels
+        val_groups, test_groups = train_test_split(
+            holdout_groups,
+            train_size=val_ratio_in_holdout,
+            test_size=1.0 - val_ratio_in_holdout,
+            random_state=seed + 1,
+            shuffle=True,
+            stratify=holdout_strat,
+        )
+        return (
+            np.asarray(train_groups, dtype=int),
+            np.asarray(val_groups, dtype=int),
+            np.asarray(test_groups, dtype=int),
+        )
+
+    split_note = (
+        f"按输入分组切分，共 {n_groups} 个唯一输入组；"
+        f"组级按 {stratify_target} 中位数分 {min(stratify_bins, n_groups)} 桶近似分层。"
+    )
+    try:
+        train_groups, val_groups, test_groups = _split_groups(use_stratify=True)
+        report_lines.append(split_note)
+    except ValueError as e:
+        train_groups, val_groups, test_groups = _split_groups(use_stratify=False)
+        report_lines.append(f"{split_note} 但分层条件不足，退化为组级随机切分：{e}")
+
+    i_train = np.flatnonzero(np.isin(group_ids, train_groups))
+    i_val = np.flatnonzero(np.isin(group_ids, val_groups))
+    i_test = np.flatnonzero(np.isin(group_ids, test_groups))
+    return i_train, i_val, i_test
+
+
+def build_split_indices(
+    df: pd.DataFrame,
+    cfg: AppConfig,
+    report_lines: List[str],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """根据配置生成 train/val/test 行索引。"""
+    if cfg.split_mode == "random":
+        report_lines.append("切分策略：随机打乱后按比例切分。")
+        return _random_split_indices(len(df), cfg.split_ratios, cfg.random_seed)
+    return _grouped_split_indices(
+        df=df,
+        ratios=cfg.split_ratios,
+        seed=cfg.random_seed,
+        stratify_target=cfg.split_stratify_target,
+        stratify_bins=cfg.split_stratify_bins,
+        report_lines=report_lines,
+    )
 
 
 def apply_train_only_outliers(
@@ -404,7 +529,7 @@ def prepare_training_data(
     X = cleaned[INPUT_COLUMNS].to_numpy(dtype=np.float64)
     y = cleaned[TARGET_COLUMNS].to_numpy(dtype=np.float64)
 
-    i_tr, i_va, i_te = stratified_split_indices(len(X), cfg.split_ratios, cfg.random_seed)
+    i_tr, i_va, i_te = build_split_indices(cleaned, cfg, report_lines)
     save_split_indices(run_dir, i_tr, i_va, i_te)
     X_train, y_train = X[i_tr], y[i_tr]
     X_val, y_val = X[i_va], y[i_va]

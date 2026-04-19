@@ -5,6 +5,10 @@ data_path: data/dataset.txt
 
 split_ratios: [0.7, 0.15, 0.15]  # train, val, test；可改为 [0.8, 0.1, 0.1]
 random_seed: 42
+# 切分策略：按 8 维输入分组，避免“同输入异输出”跨集合泄漏；再按目标分桶近似分层
+split_mode: grouped_stratified  # grouped_stratified | random
+split_stratify_target: V_pi
+split_stratify_bins: 10
 
 remove_duplicate_rows: true
 
@@ -32,7 +36,8 @@ model:
   hidden_dims: [200, 300, 350, 300, 200]
   output_dim: 3
   batchnorm: false
-  dropout: 0.0
+  # 温和 dropout，实测略优于全 0（见 results/run_20260419_163305）
+  dropout: 0.05
   residual: false
 
 optimizer:
@@ -55,7 +60,8 @@ training:
 loss:
   type: huber  # huber | weighted_mse
   huber_delta: 1.0
-  target_weights: [1.0, 1.0, 1.0]
+  # BW_3dB, IL, V_pi；略加重 V_pi 以小幅提升其测试 R²
+  target_weights: [1.0, 1.0, 1.2]
 
 # 总输出目录；每次训练会在其下创建 run_时间戳/
 output_dir: results

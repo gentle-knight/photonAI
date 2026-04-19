@@ -62,6 +62,9 @@ class AppConfig:
     data_path: str
     split_ratios: List[float]
     random_seed: int
+    split_mode: str
+    split_stratify_target: str
+    split_stratify_bins: int
     remove_duplicate_rows: bool
     outlier_strategy: str
     outlier_config: OutlierConfig
@@ -90,6 +93,9 @@ class AppConfig:
             data_path=str(raw["data_path"]),
             split_ratios=list(raw["split_ratios"]),
             random_seed=int(raw["random_seed"]),
+            split_mode=str(raw.get("split_mode", "grouped_stratified")),
+            split_stratify_target=str(raw.get("split_stratify_target", "V_pi")),
+            split_stratify_bins=int(raw.get("split_stratify_bins", 10)),
             remove_duplicate_rows=bool(raw["remove_duplicate_rows"]),
             outlier_strategy=str(raw.get("outlier_strategy", "none")),
             outlier_config=OutlierConfig(
@@ -153,6 +159,12 @@ def load_config(path: str | Path) -> AppConfig:
         raise ValueError("split_ratios 必须为长度为 3 的列表 [train, val, test]")
     if abs(sum(sr) - 1.0) > 1e-6:
         raise ValueError(f"split_ratios 之和必须为 1，当前为 {sum(sr)}")
+    if cfg.split_mode not in ("random", "grouped_stratified"):
+        raise ValueError("split_mode 必须为 random 或 grouped_stratified")
+    if cfg.split_stratify_target not in ("BW_3dB", "IL", "V_pi"):
+        raise ValueError("split_stratify_target 必须为 BW_3dB、IL 或 V_pi")
+    if cfg.split_stratify_bins < 2:
+        raise ValueError("split_stratify_bins 必须 >= 2")
     if cfg.outlier_strategy not in ("none", "iqr", "zscore", "quantile_clip"):
         raise ValueError(f"未知 outlier_strategy: {cfg.outlier_strategy}")
     if cfg.outlier_apply_to not in ("targets", "all"):

@@ -45,7 +45,7 @@
    `v_pi_min <= V_pi <= v_pi_max`（默认 **`[0, 500]`**）。**区间之外整行剔除**。  
    该步骤专门针对「以最后一列 `V_pi` 为正常范围」的需求。
 4. **（可选）严格正电压**：`remove_nonpositive_vpi: true` 时，在区间过滤之后再删除 `V_pi <= 0`（若需保留 `V_pi = 0` 且仍在 `[0,500]` 内，请保持为 `false`）。
-5. **后续步骤**：train/val/test 划分、（可选）训练集离群策略、仅在训练集上拟合 `StandardScaler` 等，与原先一致。
+5. **后续步骤**：默认采用**按 8 个输入字段分组**的 train/val/test 切分，避免「同输入异输出」同时落入不同集合；再按 `split_stratify_target`（默认 `V_pi`）做组级近似分层；之后才做（可选）训练集离群策略与仅在训练集上拟合 `StandardScaler`。
 
 清洗前会在日志与 `data_report.md` 中报告：给定 `[v_pi_min, v_pi_max]` 下 **`V_pi` 越界行数**、重复样本、同输入异输出等统计，便于核对。
 
@@ -138,7 +138,7 @@ pytest -q tests/test_smoke.py
 主要字段：
 
 - **数据与清洗**：`data_path`、`remove_duplicate_rows`、**`filter_v_pi_range` / `v_pi_min` / `v_pi_max`**（默认按 **`V_pi ∈ [0, 500]`** 剔除越界行，对应 txt **第 11 列**）、`remove_nonpositive_vpi`、`outlier_strategy`（`none` / `iqr` / `zscore` / `quantile_clip`）及 `outlier_apply_to`（`targets` / `all`）。
-- **划分**：`split_ratios`、`random_seed`；先 shuffle 再切分；**仅在训练子集**上拟合标准化器；离群阈值（若启用）也在训练子集上统计。
+- **划分**：`split_ratios`、`random_seed`、`split_mode`、`split_stratify_target`、`split_stratify_bins`。默认 `grouped_stratified`：先按 8 维输入分组，再按指定目标（默认 `V_pi`）做组级近似分层；也可切回 `random`。**仅在训练子集**上拟合标准化器；离群阈值（若启用）也在训练子集上统计。
 - **模型**：`hidden_dims`、`batchnorm`、`dropout`、`residual`。
 - **训练**：`AdamW`、`lr`、`weight_decay`、`batch_size`、`epochs`、早停 `early_stopping_patience`。
 - **调度器**：`cosine`（默认）或 `plateau`。

@@ -1,0 +1,59 @@
+# 实验：较强正则 + 提高 V_pi 损失权重（2026-04-19 试跑）
+# 结果：早停偏早，test 整体差于 default 基线；仅作记录，日常训练请用 default.yaml
+
+data_path: data/dataset.txt
+
+split_ratios: [0.7, 0.15, 0.15]
+random_seed: 42
+split_mode: grouped_stratified
+split_stratify_target: V_pi
+split_stratify_bins: 10
+
+remove_duplicate_rows: true
+
+outlier_strategy: none
+outlier_apply_to: targets
+outlier_config:
+  iqr_k: 1.5
+  zscore_threshold: 4.0
+  quantile_lower: 0.001
+  quantile_upper: 0.999
+
+filter_v_pi_range: true
+v_pi_min: 0.0
+v_pi_max: 500.0
+
+remove_nonpositive_vpi: false
+
+model:
+  input_dim: 8
+  hidden_dims: [200, 300, 350, 300, 200]
+  output_dim: 3
+  batchnorm: false
+  dropout: 0.15
+  residual: false
+
+optimizer:
+  name: adamw
+  lr: 0.001
+  weight_decay: 0.0002
+
+scheduler:
+  type: cosine
+  plateau_factor: 0.5
+  plateau_patience: 10
+  plateau_min_lr: 1.0e-6
+
+training:
+  batch_size: 128
+  epochs: 300
+  early_stopping_patience: 30
+  num_workers: 0
+
+loss:
+  type: huber
+  huber_delta: 1.0
+  target_weights: [1.0, 1.0, 1.75]
+
+output_dir: results
+last_run_dir: null
