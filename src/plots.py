@@ -13,22 +13,22 @@ import torch
 from src.config import AppConfig
 from src.data import TARGET_COLUMNS
 from src.evaluate import predict_all
-from src.model import MLPRegressor
-from src.preprocess import ProcessedDataBundle
+from src.model import create_model_from_config
+from src.preprocess import ProcessedDataBundle, inverse_transform_targets
 from src.trainer import TrainHistory, load_weights
 
 logger = logging.getLogger(__name__)
 
 
 def plot_loss_curves(history: TrainHistory, out_path: Path) -> None:
-    """绘制 train/val loss 曲线。"""
+    """绘制 train/test loss 曲线。"""
     sns.set_theme(style="whitegrid", context="talk")
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(history.epoch, history.train_loss, label="Train loss", linewidth=2)
-    ax.plot(history.epoch, history.val_loss, label="Val loss", linewidth=2)
+    ax.plot(history.epoch, history.test_loss, label="Test loss", linewidth=2)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss (normalized target space)")
-    ax.set_title("Training / Validation Loss")
+    ax.set_title("Training / Test Loss")
     ax.legend()
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,19 +104,15 @@ def generate_all_figures(
     fig_dir.mkdir(parents=True, exist_ok=True)
     plot_loss_curves(history, fig_dir / "loss_curve.png")
 
-    model = MLPRegressor(
-        input_dim=cfg.model.input_dim,
-        hidden_dims=cfg.model.hidden_dims,
-        output_dim=cfg.model.output_dim,
-        batchnorm=cfg.model.batchnorm,
-        dropout=cfg.model.dropout,
-        residual=cfg.model.residual,
-    ).to(device)
-    load_weights(model, run_dir / "checkpoints" / "best.pt", device)
+    model = create_model_from_config(cfg).to(device)
+    ckpt = run_dir / "checkpoints" / "last.pt"
+    if not ckpt.is_file():
+        ckpt = run_dir / "checkpoints" / "best.pt"
+    load_weights(model, ckpt, device)
 
     pred_n, true_n = predict_all(model, bundle.test_loader, device)
-    pred_p = bundle.y_scaler.inverse_transform(pred_n)
-    true_p = bundle.y_scaler.inverse_transform(true_n)
+    pred_p = inverse_transform_targets(pred_n, bundle.y_scalers)
+    true_p = inverse_transform_targets(true_n, bundle.y_scalers)
 
     for i, name in enumerate(TARGET_COLUMNS):
         plot_scatter_true_pred(

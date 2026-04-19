@@ -6,13 +6,14 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import torch
 
 from src.config import AppConfig, load_config
 from src.data import INPUT_COLUMNS, TARGET_COLUMNS, _strip_optional_list_brackets
-from src.model import MLPRegressor
-from src.preprocess import load_scalers
+from src.model import create_model_from_config
+from src.preprocess import inverse_transform_targets, load_scalers
 from src.trainer import load_weights
 
 logger = logging.getLogger(__name__)
@@ -68,23 +69,19 @@ def run_inference(
     载入 best 模型与 scaler，对输入表进行批量推理并写出 CSV（物理量空间）。
     """
     X = _read_inputs_table(Path(input_path)).to_numpy(dtype=np.float32)
-    X_scaler, y_scaler = load_scalers(run_dir)
+    X_scaler, y_scalers = load_scalers(run_dir)
     Xn = X_scaler.transform(X)
 
-    model = MLPRegressor(
-        input_dim=cfg.model.input_dim,
-        hidden_dims=cfg.model.hidden_dims,
-        output_dim=cfg.model.output_dim,
-        batchnorm=cfg.model.batchnorm,
-        dropout=cfg.model.dropout,
-        residual=cfg.model.residual,
-    ).to(device)
-    load_weights(model, run_dir / "checkpoints" / "best.pt", device)
+    model = create_model_from_config(cfg).to(device)
+    ckpt = run_dir / "checkpoints" / "last.pt"
+    if not ckpt.is_file():
+        ckpt = run_dir / "checkpoints" / "best.pt"
+    load_weights(model, ckpt, device)
 
     model.eval()
     with torch.no_grad():
         pred_n = model(torch.from_numpy(Xn).float().to(device)).cpu().numpy()
-    pred_p = y_scaler.inverse_transform(pred_n)
+    pred_p = inverse_transform_targets(pred_n, y_scalers)
 
     out = pd.DataFrame(X, columns=INPUT_COLUMNS)
     for j, name in enumerate(TARGET_COLUMNS):

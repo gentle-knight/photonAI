@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
@@ -10,136 +11,117 @@ import yaml
 
 
 @dataclass
+class DataConfig:
+    test_size: float = 0.1
+    random_state: int = 123
+    filter_v_pi_max: float = 500.0
+
+
+@dataclass
 class ModelConfig:
     input_dim: int = 8
-    hidden_dims: List[int] = field(default_factory=lambda: [200, 300, 350, 300, 200])
     output_dim: int = 3
-    batchnorm: bool = False
-    dropout: float = 0.0
-    residual: bool = False
+    hidden_dims: List[int] = field(default_factory=lambda: [64, 128, 64])
+    n_experts: int = 60
+    gating_hidden: int = 8
+    dropout_rate: float = 0.0
+    use_bn: bool = True
+    activation: str = "relu"
 
 
 @dataclass
 class OptimizerConfig:
-    name: str = "adamw"
     lr: float = 1e-3
-    weight_decay: float = 1e-4
-
-
-@dataclass
-class SchedulerConfig:
-    type: str = "cosine"  # cosine | plateau
-    plateau_factor: float = 0.5
-    plateau_patience: int = 10
-    plateau_min_lr: float = 1e-6
+    weight_decay: float = 0.05
+    betas: List[float] = field(default_factory=lambda: [0.9, 0.999])
 
 
 @dataclass
 class TrainingConfig:
     batch_size: int = 128
-    epochs: int = 300
-    early_stopping_patience: int = 30
+    epochs: int = 100
     num_workers: int = 0
 
 
 @dataclass
-class LossConfig:
-    type: str = "huber"  # huber | weighted_mse
-    huber_delta: float = 1.0
-    target_weights: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
-
-
-@dataclass
-class OutlierConfig:
-    iqr_k: float = 1.5
-    zscore_threshold: float = 4.0
-    quantile_lower: float = 0.001
-    quantile_upper: float = 0.999
+class PhysicsConfig:
+    lambda_bw_mon: float = 0.0
+    lambda_IL_mon: float = 0.3
+    lambda_vpiL: float = 0.005
+    lambda_smooth: float = 0.1
 
 
 @dataclass
 class AppConfig:
     data_path: str
-    split_ratios: List[float]
-    random_seed: int
-    split_mode: str
-    split_stratify_target: str
-    split_stratify_bins: int
-    remove_duplicate_rows: bool
-    outlier_strategy: str
-    outlier_config: OutlierConfig
-    outlier_apply_to: str  # targets | all
-    remove_nonpositive_vpi: bool
-    filter_v_pi_range: bool
-    v_pi_min: float
-    v_pi_max: float
+    data: DataConfig
     model: ModelConfig
     optimizer: OptimizerConfig
-    scheduler: SchedulerConfig
     training: TrainingConfig
-    loss: LossConfig
+    physics: PhysicsConfig
     output_dir: str
+    best_hyperparams_path: Optional[str] = None
     last_run_dir: Optional[str] = None
 
     @staticmethod
-    def from_dict(raw: dict[str, Any]) -> "AppConfig":
-        m = raw.get("model", {})
-        o = raw.get("optimizer", {})
-        s = raw.get("scheduler", {})
-        t = raw.get("training", {})
-        l = raw.get("loss", {})
-        oc = raw.get("outlier_config", {})
+    def from_dict(raw: dict[str, Any], cfg_dir: Path) -> "AppConfig":
+        data_raw = raw.get("data", {})
+        model_raw = raw.get("model", {})
+        optimizer_raw = raw.get("optimizer", {})
+        training_raw = raw.get("training", {})
+        physics_raw = raw.get("physics", {})
+        best_hyperparams_path = raw.get("best_hyperparams_path")
+
+        if best_hyperparams_path:
+            hp_path = Path(best_hyperparams_path)
+            if not hp_path.is_absolute():
+                cand = (cfg_dir / hp_path).resolve()
+                if cand.is_file():
+                    hp_path = cand
+                else:
+                    hp_path = (cfg_dir.parent / hp_path).resolve()
+            with hp_path.open("r", encoding="utf-8") as f:
+                hp_raw = json.load(f)
+            physics_raw = {**hp_raw.get("best_config", {}), **physics_raw}
+            best_hyperparams_path = str(hp_path)
+
         return AppConfig(
             data_path=str(raw["data_path"]),
-            split_ratios=list(raw["split_ratios"]),
-            random_seed=int(raw["random_seed"]),
-            split_mode=str(raw.get("split_mode", "grouped_stratified")),
-            split_stratify_target=str(raw.get("split_stratify_target", "V_pi")),
-            split_stratify_bins=int(raw.get("split_stratify_bins", 10)),
-            remove_duplicate_rows=bool(raw["remove_duplicate_rows"]),
-            outlier_strategy=str(raw.get("outlier_strategy", "none")),
-            outlier_config=OutlierConfig(
-                iqr_k=float(oc.get("iqr_k", 1.5)),
-                zscore_threshold=float(oc.get("zscore_threshold", 4.0)),
-                quantile_lower=float(oc.get("quantile_lower", 0.001)),
-                quantile_upper=float(oc.get("quantile_upper", 0.999)),
+            data=DataConfig(
+                test_size=float(data_raw.get("test_size", raw.get("test_size", 0.1))),
+                random_state=int(data_raw.get("random_state", raw.get("random_seed", 123))),
+                filter_v_pi_max=float(
+                    data_raw.get("filter_v_pi_max", raw.get("v_pi_max", 500.0))
+                ),
             ),
-            outlier_apply_to=str(raw.get("outlier_apply_to", "targets")),
-            remove_nonpositive_vpi=bool(raw.get("remove_nonpositive_vpi", False)),
-            filter_v_pi_range=bool(raw.get("filter_v_pi_range", True)),
-            v_pi_min=float(raw.get("v_pi_min", 0.0)),
-            v_pi_max=float(raw.get("v_pi_max", 500.0)),
             model=ModelConfig(
-                input_dim=int(m.get("input_dim", 8)),
-                hidden_dims=list(m.get("hidden_dims", [200, 300, 350, 300, 200])),
-                output_dim=int(m.get("output_dim", 3)),
-                batchnorm=bool(m.get("batchnorm", False)),
-                dropout=float(m.get("dropout", 0.0)),
-                residual=bool(m.get("residual", False)),
+                input_dim=int(model_raw.get("input_dim", 8)),
+                output_dim=int(model_raw.get("output_dim", 3)),
+                hidden_dims=list(model_raw.get("hidden_dims", [64, 128, 64])),
+                n_experts=int(model_raw.get("n_experts", 60)),
+                gating_hidden=int(model_raw.get("gating_hidden", 8)),
+                dropout_rate=float(model_raw.get("dropout_rate", 0.0)),
+                use_bn=bool(model_raw.get("use_bn", True)),
+                activation=str(model_raw.get("activation", "relu")),
             ),
             optimizer=OptimizerConfig(
-                name=str(o.get("name", "adamw")),
-                lr=float(o.get("lr", 1e-3)),
-                weight_decay=float(o.get("weight_decay", 1e-4)),
-            ),
-            scheduler=SchedulerConfig(
-                type=str(s.get("type", "cosine")),
-                plateau_factor=float(s.get("plateau_factor", 0.5)),
-                plateau_patience=int(s.get("plateau_patience", 10)),
-                plateau_min_lr=float(s.get("plateau_min_lr", 1e-6)),
+                lr=float(optimizer_raw.get("lr", 1e-3)),
+                weight_decay=float(optimizer_raw.get("weight_decay", 0.05)),
+                betas=[float(x) for x in optimizer_raw.get("betas", [0.9, 0.999])],
             ),
             training=TrainingConfig(
-                batch_size=int(t.get("batch_size", 128)),
-                epochs=int(t.get("epochs", 300)),
-                early_stopping_patience=int(t.get("early_stopping_patience", 30)),
-                num_workers=int(t.get("num_workers", 0)),
+                batch_size=int(training_raw.get("batch_size", 128)),
+                epochs=int(training_raw.get("epochs", 100)),
+                num_workers=int(training_raw.get("num_workers", 0)),
             ),
-            loss=LossConfig(
-                type=str(l.get("type", "huber")),
-                huber_delta=float(l.get("huber_delta", 1.0)),
-                target_weights=[float(x) for x in l.get("target_weights", [1.0, 1.0, 1.0])],
+            physics=PhysicsConfig(
+                lambda_bw_mon=float(physics_raw.get("lambda_bw_mon", 0.0)),
+                lambda_IL_mon=float(physics_raw.get("lambda_IL_mon", 0.3)),
+                lambda_vpiL=float(physics_raw.get("lambda_vpiL", 0.005)),
+                lambda_smooth=float(physics_raw.get("lambda_smooth", 0.1)),
             ),
             output_dir=str(raw.get("output_dir", "results")),
+            best_hyperparams_path=best_hyperparams_path,
             last_run_dir=raw.get("last_run_dir"),
         )
 
@@ -153,24 +135,25 @@ def load_config(path: str | Path) -> AppConfig:
         raw = yaml.safe_load(f)
     if not isinstance(raw, dict):
         raise ValueError("YAML 根节点必须是字典")
-    cfg = AppConfig.from_dict(raw)
-    sr = cfg.split_ratios
-    if len(sr) != 3:
-        raise ValueError("split_ratios 必须为长度为 3 的列表 [train, val, test]")
-    if abs(sum(sr) - 1.0) > 1e-6:
-        raise ValueError(f"split_ratios 之和必须为 1，当前为 {sum(sr)}")
-    if cfg.split_mode not in ("random", "grouped_stratified"):
-        raise ValueError("split_mode 必须为 random 或 grouped_stratified")
-    if cfg.split_stratify_target not in ("BW_3dB", "IL", "V_pi"):
-        raise ValueError("split_stratify_target 必须为 BW_3dB、IL 或 V_pi")
-    if cfg.split_stratify_bins < 2:
-        raise ValueError("split_stratify_bins 必须 >= 2")
-    if cfg.outlier_strategy not in ("none", "iqr", "zscore", "quantile_clip"):
-        raise ValueError(f"未知 outlier_strategy: {cfg.outlier_strategy}")
-    if cfg.outlier_apply_to not in ("targets", "all"):
-        raise ValueError("outlier_apply_to 必须为 targets 或 all")
-    if len(cfg.loss.target_weights) != 3:
-        raise ValueError("loss.target_weights 长度必须为 3")
-    if cfg.filter_v_pi_range and cfg.v_pi_min >= cfg.v_pi_max:
-        raise ValueError("启用 filter_v_pi_range 时须满足 v_pi_min < v_pi_max")
+    cfg = AppConfig.from_dict(raw, path.parent.resolve())
+    if not 0.0 < cfg.data.test_size < 1.0:
+        raise ValueError("data.test_size 必须在 (0, 1) 之间")
+    if cfg.data.filter_v_pi_max <= 0:
+        raise ValueError("data.filter_v_pi_max 必须 > 0")
+    if cfg.model.input_dim != 8:
+        raise ValueError("model.input_dim 必须为 8")
+    if cfg.model.output_dim != 3:
+        raise ValueError("model.output_dim 必须为 3")
+    if not cfg.model.hidden_dims:
+        raise ValueError("model.hidden_dims 不能为空")
+    if cfg.model.n_experts < 1:
+        raise ValueError("model.n_experts 必须 >= 1")
+    if cfg.model.gating_hidden < 1:
+        raise ValueError("model.gating_hidden 必须 >= 1")
+    if cfg.model.activation not in ("relu", "gaussian"):
+        raise ValueError("model.activation 必须为 relu 或 gaussian")
+    if len(cfg.optimizer.betas) != 2:
+        raise ValueError("optimizer.betas 长度必须为 2")
+    if cfg.training.batch_size < 1 or cfg.training.epochs < 1:
+        raise ValueError("training.batch_size 与 training.epochs 必须 >= 1")
     return cfg

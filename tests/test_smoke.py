@@ -1,4 +1,4 @@
-"""最小冒烟测试：模型 shape 与单 epoch 训练不报错。"""
+"""最小冒烟测试：MoE + PINN 流程可运行。"""
 
 from __future__ import annotations
 
@@ -10,82 +10,93 @@ import torch
 import yaml
 
 from src.config import load_config
-from src.data import INPUT_COLUMNS
 from src.data import load_raw_txt
-from src.model import MLPRegressor
-from src.preprocess import prepare_training_data
-from src.trainer import fit
+from src.model import create_model_from_config
+from src.preprocess import inverse_transform_targets, prepare_training_data
+from src.trainer import compute_pinn_loss, fit
 
 
-def _write_synthetic_txt(path: Path, n: int = 64) -> None:
+def _write_synthetic_txt(path: Path, n: int = 96) -> None:
     rng = np.random.default_rng(0)
     x = rng.normal(size=(n, 8))
     y = np.zeros((n, 3))
-    y[:, 0] = rng.normal(size=n)
-    y[:, 1] = rng.normal(size=n)
-    # 第 11 列 V_pi 落在默认物理门控 [0, 500] 内
-    y[:, 2] = rng.uniform(1.0, 400.0, size=n)
+    length = np.abs(x[:, 7]) + 0.5
+    y[:, 0] = 2.0 - 0.2 * length + rng.normal(scale=0.05, size=n)
+    y[:, 1] = 0.3 + 0.1 * length + rng.normal(scale=0.03, size=n)
+    y[:, 2] = 20.0 / length + rng.normal(scale=0.2, size=n)
     mat = np.hstack([x, y])
-    lines = [",".join(str(v) for v in row) for row in mat]
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text("\n".join(",".join(str(v) for v in row) for row in mat), encoding="utf-8")
 
 
-def test_mlp_forward_shape() -> None:
-    m = MLPRegressor(8, [16, 16], 3, batchnorm=False, dropout=0.0, residual=False)
+def _make_cfg(tmp_path: Path, data_txt: Path, epochs: int = 1) -> Path:
+    cfg_dict = {
+        "data_path": str(data_txt),
+        "data": {
+            "test_size": 0.1,
+            "random_state": 123,
+            "filter_v_pi_max": 500.0,
+        },
+        "model": {
+            "input_dim": 8,
+            "output_dim": 3,
+            "hidden_dims": [16, 16],
+            "n_experts": 4,
+            "gating_hidden": 4,
+            "dropout_rate": 0.0,
+            "use_bn": False,
+            "activation": "relu",
+        },
+        "optimizer": {
+            "lr": 0.001,
+            "weight_decay": 0.01,
+            "betas": [0.9, 0.999],
+        },
+        "training": {
+            "batch_size": 16,
+            "epochs": epochs,
+            "num_workers": 0,
+        },
+        "physics": {
+            "lambda_bw_mon": 0.1,
+            "lambda_IL_mon": 0.1,
+            "lambda_vpiL": 0.05,
+            "lambda_smooth": 0.01,
+        },
+        "output_dir": str(tmp_path / "results"),
+    }
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_dict), encoding="utf-8")
+    return cfg_path
+
+
+def test_moe_forward_shape(tmp_path: Path) -> None:
+    data_txt = tmp_path / "data.txt"
+    _write_synthetic_txt(data_txt, n=32)
+    cfg = load_config(_make_cfg(tmp_path, data_txt))
+    model = create_model_from_config(cfg)
     x = torch.randn(5, 8)
-    y = m(x)
+    y = model(x)
     assert y.shape == (5, 3)
+
+
+def test_pinn_loss_backpropagates(tmp_path: Path) -> None:
+    data_txt = tmp_path / "data.txt"
+    _write_synthetic_txt(data_txt, n=40)
+    cfg = load_config(_make_cfg(tmp_path, data_txt))
+    model = create_model_from_config(cfg)
+    x = torch.randn(8, 8)
+    y = torch.randn(8, 3)
+    loss, data_loss, terms = compute_pinn_loss(model, x, y, torch.nn.MSELoss(), cfg)
+    loss.backward()
+    assert float(loss.detach()) >= float(data_loss.detach())
+    assert "IL_mon" in terms
+    assert any(p.grad is not None for p in model.parameters())
 
 
 def test_one_epoch_training_pipeline(tmp_path: Path) -> None:
     data_txt = tmp_path / "data.txt"
     _write_synthetic_txt(data_txt, n=80)
-
-    cfg_dict = {
-        "data_path": str(data_txt),
-        "split_ratios": [0.7, 0.15, 0.15],
-        "random_seed": 1,
-        "remove_duplicate_rows": False,
-        "outlier_strategy": "none",
-        "outlier_apply_to": "targets",
-        "outlier_config": {
-            "iqr_k": 1.5,
-            "zscore_threshold": 4.0,
-            "quantile_lower": 0.001,
-            "quantile_upper": 0.999,
-        },
-        "remove_nonpositive_vpi": False,
-        "filter_v_pi_range": True,
-        "v_pi_min": 0.0,
-        "v_pi_max": 500.0,
-        "model": {
-            "input_dim": 8,
-            "hidden_dims": [32, 32],
-            "output_dim": 3,
-            "batchnorm": False,
-            "dropout": 0.0,
-            "residual": False,
-        },
-        "optimizer": {"name": "adamw", "lr": 0.01, "weight_decay": 0.0},
-        "scheduler": {
-            "type": "cosine",
-            "plateau_factor": 0.5,
-            "plateau_patience": 10,
-            "plateau_min_lr": 1e-6,
-        },
-        "training": {
-            "batch_size": 16,
-            "epochs": 1,
-            "early_stopping_patience": 1,
-            "num_workers": 0,
-        },
-        "loss": {"type": "huber", "huber_delta": 1.0, "target_weights": [1.0, 1.0, 1.0]},
-        "output_dir": str(tmp_path / "results"),
-    }
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(yaml.safe_dump(cfg_dict), encoding="utf-8")
-
-    cfg = load_config(cfg_path)
+    cfg = load_config(_make_cfg(tmp_path, data_txt, epochs=1))
     df = load_raw_txt(data_txt)
 
     run_dir = tmp_path / "run0"
@@ -95,99 +106,12 @@ def test_one_epoch_training_pipeline(tmp_path: Path) -> None:
 
     bundle = prepare_training_data(df, cfg, run_dir)
     device = torch.device("cpu")
-    model = MLPRegressor(
-        input_dim=cfg.model.input_dim,
-        hidden_dims=cfg.model.hidden_dims,
-        output_dim=cfg.model.output_dim,
-        batchnorm=cfg.model.batchnorm,
-        dropout=cfg.model.dropout,
-        residual=cfg.model.residual,
-    ).to(device)
-    fit(model, cfg, bundle.train_loader, bundle.val_loader, run_dir, device)
-    assert (run_dir / "checkpoints" / "best.pt").is_file()
+    model = create_model_from_config(cfg).to(device)
+    history = fit(model, cfg, bundle, run_dir, device)
+    assert (run_dir / "checkpoints" / "last.pt").is_file()
+    assert len(history.train_loss) == 1
     meta = json.loads((run_dir / "cleaning_meta.json").read_text(encoding="utf-8"))
     assert meta["n_train"] > 0
-
-
-def test_grouped_split_keeps_same_inputs_together(tmp_path: Path) -> None:
-    data_txt = tmp_path / "grouped_data.txt"
-    rng = np.random.default_rng(7)
-    rows = []
-    base_inputs = rng.normal(size=(24, 8))
-    for x in base_inputs:
-        for _ in range(3):
-            y0 = float(x[0] * 2.0 + rng.normal(scale=0.01))
-            y1 = float(x[1] * -1.5 + rng.normal(scale=0.01))
-            y2 = float(abs(x[2]) * 20.0 + 10.0 + rng.normal(scale=0.1))
-            rows.append(np.concatenate([x, [y0, y1, y2]]))
-    mat = np.asarray(rows, dtype=float)
-    data_txt.write_text(
-        "\n".join(",".join(str(v) for v in row) for row in mat),
-        encoding="utf-8",
-    )
-
-    cfg_dict = {
-        "data_path": str(data_txt),
-        "split_ratios": [0.7, 0.15, 0.15],
-        "random_seed": 3,
-        "split_mode": "grouped_stratified",
-        "split_stratify_target": "V_pi",
-        "split_stratify_bins": 6,
-        "remove_duplicate_rows": False,
-        "outlier_strategy": "none",
-        "outlier_apply_to": "targets",
-        "outlier_config": {
-            "iqr_k": 1.5,
-            "zscore_threshold": 4.0,
-            "quantile_lower": 0.001,
-            "quantile_upper": 0.999,
-        },
-        "remove_nonpositive_vpi": False,
-        "filter_v_pi_range": True,
-        "v_pi_min": 0.0,
-        "v_pi_max": 500.0,
-        "model": {
-            "input_dim": 8,
-            "hidden_dims": [16, 16],
-            "output_dim": 3,
-            "batchnorm": False,
-            "dropout": 0.0,
-            "residual": False,
-        },
-        "optimizer": {"name": "adamw", "lr": 0.01, "weight_decay": 0.0},
-        "scheduler": {
-            "type": "cosine",
-            "plateau_factor": 0.5,
-            "plateau_patience": 10,
-            "plateau_min_lr": 1e-6,
-        },
-        "training": {
-            "batch_size": 16,
-            "epochs": 1,
-            "early_stopping_patience": 1,
-            "num_workers": 0,
-        },
-        "loss": {"type": "huber", "huber_delta": 1.0, "target_weights": [1.0, 1.0, 1.0]},
-        "output_dir": str(tmp_path / "results"),
-    }
-    cfg_path = tmp_path / "cfg_grouped.yaml"
-    cfg_path.write_text(yaml.safe_dump(cfg_dict), encoding="utf-8")
-
-    cfg = load_config(cfg_path)
-    df = load_raw_txt(data_txt)
-    run_dir = tmp_path / "run_grouped"
-    run_dir.mkdir()
-    bundle = prepare_training_data(df, cfg, run_dir)
-
-    split_data = json.loads((run_dir / "split_indices.json").read_text(encoding="utf-8"))
-    split_name_by_row = {}
-    for split_name, indices in split_data.items():
-        for idx in indices:
-            split_name_by_row[int(idx)] = split_name
-
-    cleaned = df.reset_index(drop=True)
-    for _, sub in cleaned.groupby(INPUT_COLUMNS, dropna=False):
-        assigned = {split_name_by_row[int(i)] for i in sub.index.to_list()}
-        assert len(assigned) == 1
-
-    assert len(bundle.X_train) > 0
+    assert meta["n_test"] > 0
+    restored = inverse_transform_targets(bundle.y_test[:3], bundle.y_scalers)
+    assert restored.shape == (3, 3)

@@ -1,4 +1,4 @@
-"""可配置 MLP 回归模型。"""
+"""MoE PINN 模型定义。"""
 
 from __future__ import annotations
 
@@ -8,54 +8,103 @@ import torch
 import torch.nn as nn
 
 
-def kaiming_init_module(m: nn.Module) -> None:
-    """对 Linear 使用 Kaiming uniform（ReLU），偏置置零。"""
-    if isinstance(m, nn.Linear):
-        nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.BatchNorm1d):
-        nn.init.ones_(m.weight)
-        nn.init.zeros_(m.bias)
+class GaussianActivation(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.exp(-(x**2))
 
 
-class MLPRegressor(nn.Module):
-    """
-    多层感知机回归：输入 8 维，输出 3 维。
+def weights_init(layer_in: nn.Module) -> None:
+    """与 notebook 保持一致的 Kaiming 初始化。"""
+    if isinstance(layer_in, nn.Linear):
+        nn.init.kaiming_uniform_(layer_in.weight)
+        if layer_in.bias is not None:
+            layer_in.bias.data.fill_(0.0)
 
-    可选 BatchNorm1d、Dropout、以及在相邻层维度相等时的残差相加。
-    """
 
+def build_activation(name: str) -> nn.Module:
+    if name == "relu":
+        return nn.ReLU()
+    if name == "gaussian":
+        return GaussianActivation()
+    raise ValueError(f"未知激活函数: {name}")
+
+
+class ExpertNN(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        hidden_dims: List[int],
         output_dim: int,
-        batchnorm: bool = False,
-        dropout: float = 0.0,
-        residual: bool = False,
+        hidden_dims: List[int],
+        activation_fn: nn.Module,
+        dropout_rate: float = 0.0,
+        use_bn: bool = False,
     ) -> None:
         super().__init__()
-        self.residual = residual
-        dims = [input_dim] + list(hidden_dims) + [output_dim]
-        self._hidden_blocks = nn.ModuleList()
-        for i in range(len(dims) - 2):
-            in_d, out_d = dims[i], dims[i + 1]
-            seq_layers: list[nn.Module] = [nn.Linear(in_d, out_d)]
-            if batchnorm:
-                seq_layers.append(nn.BatchNorm1d(out_d))
-            seq_layers.append(nn.ReLU(inplace=True))
-            if dropout and dropout > 0:
-                seq_layers.append(nn.Dropout(p=dropout))
-            self._hidden_blocks.append(nn.Sequential(*seq_layers))
-        self._head = nn.Linear(dims[-2], dims[-1])
-        self.apply(kaiming_init_module)
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(prev_dim, h))
+            if use_bn:
+                layers.append(nn.BatchNorm1d(h))
+            layers.append(type(activation_fn)() if isinstance(activation_fn, nn.ReLU) else activation_fn.__class__())
+            if dropout_rate > 0:
+                layers.append(nn.Dropout(p=dropout_rate))
+            prev_dim = h
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = x
-        for block in self._hidden_blocks:
-            inp = h
-            h = block(inp)
-            if self.residual and inp.shape[-1] == h.shape[-1]:
-                h = h + inp
-        return self._head(h)
+        return self.net(x)
+
+
+class MixtureOfExperts(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: List[int],
+        n_experts: int = 3,
+        activation_fn: nn.Module | None = None,
+        gating_hidden: int = 32,
+        dropout_rate: float = 0.0,
+        use_bn: bool = False,
+    ) -> None:
+        super().__init__()
+        act = activation_fn if activation_fn is not None else nn.ReLU()
+        self.experts = nn.ModuleList(
+            [
+                ExpertNN(
+                    input_dim,
+                    output_dim,
+                    hidden_dims,
+                    act,
+                    dropout_rate=dropout_rate,
+                    use_bn=use_bn,
+                )
+                for _ in range(n_experts)
+            ]
+        )
+        self.gating = nn.Sequential(
+            nn.Linear(input_dim, gating_hidden),
+            nn.ReLU(),
+            nn.Linear(gating_hidden, n_experts),
+            nn.Softmax(dim=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_weights = self.gating(x)
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
+        return torch.bmm(expert_outputs, gate_weights.unsqueeze(2)).squeeze(2)
+
+
+def create_model_from_config(cfg) -> MixtureOfExperts:
+    return MixtureOfExperts(
+        input_dim=cfg.model.input_dim,
+        output_dim=cfg.model.output_dim,
+        hidden_dims=cfg.model.hidden_dims,
+        n_experts=cfg.model.n_experts,
+        activation_fn=build_activation(cfg.model.activation),
+        gating_hidden=cfg.model.gating_hidden,
+        dropout_rate=cfg.model.dropout_rate,
+        use_bn=cfg.model.use_bn,
+    )

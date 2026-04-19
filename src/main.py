@@ -13,7 +13,7 @@ import torch
 from src.config import load_config
 from src.data import load_raw_txt, quality_report_before_clean, summarize_for_console
 from src.evaluate import export_test_predictions_csv, run_full_evaluation
-from src.model import MLPRegressor
+from src.model import create_model_from_config, weights_init
 from src.plots import generate_all_figures
 from src.preprocess import prepare_training_data, rebuild_bundle_for_eval
 from src.trainer import fit
@@ -61,7 +61,7 @@ def _write_summary_md(run_dir: Path, summary: dict) -> None:
         lines.append(f"## {split}")
         lines.append("")
         lines.append(
-            f"- **损失（标准化输出空间 Huber/MSE 准则）**: {block['loss']:.6f}"
+            f"- **损失（标准化输出空间 MSE）**: {block['loss']:.6f}"
         )
         for space, label in ("normalized", "标准化空间"), ("physical", "物理量空间"):
             sub = block[space]
@@ -78,7 +78,7 @@ def _write_summary_md(run_dir: Path, summary: dict) -> None:
 def cmd_train(args: argparse.Namespace) -> None:
     cfg_path = _resolve_cfg_path(args.config)
     cfg = load_config(cfg_path)
-    set_global_seed(cfg.random_seed)
+    set_global_seed(cfg.data.random_state)
 
     run_dir = make_run_dir(resolve_path(cfg.output_dir, _project_root()))
     shutil.copy2(cfg_path, run_dir / "config_snapshot.yaml")
@@ -86,21 +86,15 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     data_path = resolve_path(cfg.data_path, _project_root())
     df = load_raw_txt(data_path)
-    q = quality_report_before_clean(df, cfg.v_pi_min, cfg.v_pi_max)
+    q = quality_report_before_clean(df, 0.0, cfg.data.filter_v_pi_max)
     logger.info("数据质量(清洗前): %s", summarize_for_console(df, q))
 
     bundle = prepare_training_data(df, cfg, run_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLPRegressor(
-        input_dim=cfg.model.input_dim,
-        hidden_dims=cfg.model.hidden_dims,
-        output_dim=cfg.model.output_dim,
-        batchnorm=cfg.model.batchnorm,
-        dropout=cfg.model.dropout,
-        residual=cfg.model.residual,
-    ).to(device)
+    model = create_model_from_config(cfg).to(device)
+    model.apply(weights_init)
 
-    history = fit(model, cfg, bundle.train_loader, bundle.val_loader, run_dir, device)
+    history = fit(model, cfg, bundle, run_dir, device)
     model_eval, summary = run_full_evaluation(cfg, bundle, run_dir, device)
     export_test_predictions_csv(
         bundle, model_eval, device, run_dir / "test_predictions.csv"
@@ -115,7 +109,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
     run_dir = _resolve_run_dir(cfg_path, args.run_dir, args.output_dir)
     snap = run_dir / "config_snapshot.yaml"
     cfg = load_config(snap if snap.is_file() else cfg_path)
-    set_global_seed(cfg.random_seed)
+    set_global_seed(cfg.data.random_state)
     setup_logging(run_dir / "eval.log")
 
     data_path = resolve_path(cfg.data_path, _project_root())
@@ -135,7 +129,7 @@ def cmd_infer(args: argparse.Namespace) -> None:
     run_dir = _resolve_run_dir(cfg_path, args.run_dir, args.output_dir)
     snap = run_dir / "config_snapshot.yaml"
     cfg = load_config(snap if snap.is_file() else cfg_path)
-    set_global_seed(cfg.random_seed)
+    set_global_seed(cfg.data.random_state)
     setup_logging(None)
 
     from src.infer import run_inference
@@ -147,7 +141,7 @@ def cmd_infer(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="MZM MLP 训练 / 评估 / 推理")
+    p = argparse.ArgumentParser(description="MZM MoE PINN 训练 / 评估 / 推理")
     sub = p.add_subparsers(dest="command", required=True)
 
     pt = sub.add_parser("train", help="训练模型")
